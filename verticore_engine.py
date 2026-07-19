@@ -26,13 +26,22 @@ import pandas as pd
 # ── SMB derivation ─────────────────────────────────────────────────────────────
 def derive_smb_count(smb_base_df, vertical, geo, year):
     """
-    SMB count = sum over the vertical's NACE codes of (TOTAL - GE250) enterprises.
-    Using TOTAL minus large (GE250) is robust even when granular SMB bands are
-    suppressed for small countries. Returns (count, detail_dict).
+    SMB count derivation. Handles two data shapes:
+
+    Shape A (sbs_sc_ovw with size classes): sum TOTAL - GE250 per NACE code.
+    Shape B (sbs_ovw_act, total only): sbs_ovw_act has no size_emp dimension
+      so all rows carry a TOTAL/proxy label. When no GE250 row exists, the
+      total enterprise count IS the SMB proxy — these verticals (hairdressers,
+      small builders, repair shops, sports clubs) are overwhelmingly micro/small.
+
+    Returns (count, detail_dict).
     """
     if smb_base_df is None or smb_base_df.empty:
         return None, {}
     df = smb_base_df.copy()
+    df["Enterprise Count"] = pd.to_numeric(
+        df["Enterprise Count"].astype(str).str.replace(",", "."), errors="coerce"
+    )
     df = df[(df["Vertical"] == vertical) & (df["Geo"] == geo) & (df["Year"].astype(str) == str(year))]
     if df.empty:
         return None, {}
@@ -41,17 +50,23 @@ def derive_smb_count(smb_base_df, vertical, geo, year):
     large = 0.0
     per_code = {}
     for code in df["NACE Code"].unique():
-        sub = df[df["NACE Code"] == code]
-        t = sub[sub["Size Class"] == "TOTAL"]["Enterprise Count"]
-        g = sub[sub["Size Class"] == "GE250"]["Enterprise Count"]
-        t_val = float(t.iloc[0]) if not t.empty else 0.0
-        g_val = float(g.iloc[0]) if not g.empty else 0.0
-        smb_val = max(t_val - g_val, 0.0)
-        total += t_val
-        large += g_val
+        sub   = df[df["NACE Code"] == code]
+        # TOTAL row: any row whose Size Class starts with "TOTAL"
+        t_rows = sub[sub["Size Class"].astype(str).str.startswith("TOTAL")]
+        g_rows = sub[sub["Size Class"].astype(str) == "GE250"]
+        t_val  = float(t_rows["Enterprise Count"].iloc[0]) if not t_rows.empty else 0.0
+        g_val  = float(g_rows["Enterprise Count"].iloc[0]) if not g_rows.empty else 0.0
+        # Shape B: no GE250 row → total IS the count (no large-enterprise deduction)
+        smb_val = max(t_val - g_val, 0.0) if not g_rows.empty else t_val
+        total  += t_val
+        large  += g_val
         per_code[code] = smb_val
-    smb = max(total - large, 0.0)
-    return smb, {"total": total, "large": large, "per_code": per_code}
+
+    # Shape B at aggregate level: no GE250 data → use total directly
+    has_ge250 = not df[df["Size Class"].astype(str) == "GE250"].empty
+    smb = max(total - large, 0.0) if has_ge250 else total
+    return smb, {"total": total, "large": large, "per_code": per_code,
+                 "size_class_available": has_ge250}
 
 
 # ── Adoption + micro-enterprise adjustment ─────────────────────────────────────
