@@ -24,4 +24,4 @@ jobs:
         run: pip install requests
 
       - name: Run API diagnostic
-        run: python verticore_api_test.py
+        run: python verticore_api_test2.py
