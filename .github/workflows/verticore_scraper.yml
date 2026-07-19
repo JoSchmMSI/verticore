@@ -1,0 +1,58 @@
+name: Verticore — Scheduled Scrapers
+
+on:
+  schedule:
+    # Weekly — every Thursday 20:00 Helsinki (EET = UTC+3 → 17:00 UTC).
+    # Runs both Verticore scrapers: SMB counts (Eurostat SBS) and adoption
+    # (Eurostat ICT), populating the Google Sheet the app reads from.
+    - cron: "0 17 * * 4"
+
+  # Manual trigger for testing without waiting for the schedule.
+  workflow_dispatch:
+
+jobs:
+  verticore-scrapers:
+    name: Verticore Data Scrapers
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      # Secrets injected as environment variables — read directly by the
+      # scrapers (os.environ), no credentials file written to disk.
+      GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+      VERTICORE_SHEET_ID: ${{ secrets.VERTICORE_SHEET_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate secrets present
+        run: |
+          if [ -z "$GOOGLE_CREDENTIALS_JSON" ]; then
+            echo "ERROR: GOOGLE_CREDENTIALS_JSON secret is empty."; exit 1
+          fi
+          if [ -z "$VERTICORE_SHEET_ID" ]; then
+            echo "ERROR: VERTICORE_SHEET_ID secret is empty."; exit 1
+          fi
+          echo "Secrets present. Credentials length: ${#GOOGLE_CREDENTIALS_JSON} chars."
+
+      - name: Run SMB count scraper (Eurostat SBS)
+        run: python verticore_smb_scraper.py
+        continue-on-error: true
+
+      - name: Run adoption scraper (Eurostat ICT)
+        run: python verticore_adoption_scraper.py
+        continue-on-error: true
+
+      - name: Done
+        run: echo "Verticore scrape run complete."
