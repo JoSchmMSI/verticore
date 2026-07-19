@@ -1,0 +1,24 @@
+# ── Secrets & credentials — NEVER commit these ────────────────────────────────
+credentials.json
+*.json
+.env
+.env.*
+sheet_id.txt
+*_secret*
+*_key*
+
+# ── Python junk ────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# ── Local dev ──────────────────────────────────────────────────────────────────
+.venv/
+venv/
+.DS_Store
+*.log
