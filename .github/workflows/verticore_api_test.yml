@@ -1,0 +1,27 @@
+name: Verticore — API Diagnostic (one-time test)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  api-diagnostic:
+    name: Eurostat API Parameter Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Run API diagnostic
+        run: python verticore_api_test.py
