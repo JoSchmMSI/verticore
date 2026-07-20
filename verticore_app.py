@@ -29,6 +29,7 @@ import requests as req
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 import verticore_engine as ve
+import verticore_cache as vc
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 def _secret(key, default=""):
@@ -39,6 +40,7 @@ def _secret(key, default=""):
 
 SHEET_ID    = _secret("VERTICORE_SHEET_ID")
 ANTHROPIC_KEY = _secret("ANTHROPIC_API_KEY")
+GEMINI_KEY    = _secret("GEMINI_API_KEY")   # free tier — no credit card needed
 SCOPES      = ["https://www.googleapis.com/auth/spreadsheets.readonly",
                "https://www.googleapis.com/auth/drive.readonly"]
 CLR         = "#2F5D50"
@@ -152,31 +154,61 @@ def to_num(df, cols):
 CLAUDE_MODEL = "claude-sonnet-4-6"
 
 def claude_call(system_prompt, user_prompt, max_tokens=800):
-    """Call the Claude API. Returns text or None on failure."""
-    if not ANTHROPIC_KEY:
-        return None
-    try:
-        r = req.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": CLAUDE_MODEL,
-                "max_tokens": max_tokens,
-                "system": system_prompt,
-                "messages": [{"role": "user", "content": user_prompt}],
-            },
-            timeout=30,
-        )
-        if r.status_code != 200:
-            return None
-        blocks = r.json().get("content", [])
-        return "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-    except Exception:
-        return None
+    """
+    Hybrid AI call — three layers:
+    1. Claude API (if ANTHROPIC_API_KEY set)
+    2. Gemini free tier (if GEMINI_API_KEY set)
+    3. Returns None (teaser card shown)
+    Cache is checked before this function is called (in validate_vertical
+    and generate_build_priority wrappers).
+    """
+    # Layer 1: Claude API
+    if ANTHROPIC_KEY:
+        try:
+            r = req.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": CLAUDE_MODEL,
+                    "max_tokens": max_tokens,
+                    "system": system_prompt,
+                    "messages": [{"role": "user", "content": user_prompt}],
+                },
+                timeout=30,
+            )
+            if r.status_code == 200:
+                blocks = r.json().get("content", [])
+                return "".join(b.get("text", "") for b in blocks
+                               if b.get("type") == "text")
+        except Exception:
+            pass
+
+    # Layer 2: Gemini free tier
+    if GEMINI_KEY:
+        try:
+            # Combine system + user for Gemini (no system role in free REST API)
+            combined = system_prompt.strip() + "\n\n" + user_prompt.strip()
+            r = req.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
+                json={"contents": [{"parts": [{"text": combined}]}],
+                      "generationConfig": {"maxOutputTokens": max_tokens,
+                                           "temperature": 0.3}},
+                timeout=30,
+            )
+            if r.status_code == 200:
+                candidates = r.json().get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    return "".join(p.get("text", "") for p in parts)
+        except Exception:
+            pass
+
+    return None
 
 def validate_vertical(raw_input):
     """
@@ -211,9 +243,15 @@ Rules:
   reason must explain this is not an SMB web-services vertical.
 - Never invent NACE codes — use standard Eurostat Rev.2 codes only."""
 
+    # Check pre-computed cache first — instant, no API call
+    cached = vc.get_cached_validation(raw_input)
+    if cached:
+        return cached
+
     result = claude_call(system, f'Validate this vertical: "{raw_input}"', max_tokens=300)
     if not result:
-        return {"valid": False, "reason": "AI validation unavailable — check API key."}
+        return {"valid": False, "reason": "Vertical not in cache and AI unavailable. "
+                "Try: beauty salons, yoga, restaurants, dog grooming, cleaning, auto repair, bakeries."}
     try:
         clean = result.strip()
         if clean.startswith("```"):
@@ -311,6 +349,11 @@ Rules:
         f"Obtainable market: {numeric_market}\n\n"
         f"Generate the 5 highest-priority web features to build for this vertical."
     )
+    # Check pre-computed feature cache first
+    cached_features = vc.get_cached_features(canonical_name)
+    if cached_features:
+        return cached_features
+
     result = claude_call(system, prompt, max_tokens=800)
     if not result:
         return []
@@ -398,10 +441,9 @@ st.markdown('<div class="sec">Select or enter your target vertical</div>',
 col_mode, col_v, col_geo, col_arpu = st.columns([1.2, 2, 2, 1.5])
 with col_mode:
     _mode_opts = ["Seed vertical", "Enter any vertical"]
+    _ai_status = "AI enabled (Claude)." if ANTHROPIC_KEY else                ("AI enabled (Gemini free)." if GEMINI_KEY else                "35+ verticals available from cache — AI coming soon.")
     _mode_help = ("Seed = instant pre-loaded data. "
-                  "Enter any vertical = AI resolves + live Eurostat query "
-                  + ("(API key not configured — coming soon)."
-                     if not ANTHROPIC_KEY else "(AI enabled)."))
+                  "Enter any vertical = resolves any SMB vertical. " + _ai_status)
     mode = st.selectbox("Mode", _mode_opts, key="v_mode", help=_mode_help)
 
 use_ai = (mode == "Enter any vertical")
@@ -444,15 +486,21 @@ if use_ai:
                 "artisan bakeries, dog grooming, independent pharmacies.")
         st.stop()
 
-    if not ANTHROPIC_KEY:
-        st.markdown(f"""<div class="note">
-          <strong>AI vertical analysis coming soon.</strong>
-          The market-sizing engine is fully live for the four seed verticals below.
-          Free-text vertical entry and build-priority ranking will be enabled shortly.
-          <br><span style="font-size:0.75rem;">Switch mode to <em>Seed vertical</em>
-          to explore live market data now.</span>
-        </div>""", unsafe_allow_html=True)
-        st.stop()
+    # Allow through if Gemini key available OR cache may have this vertical.
+    # Only block if truly nothing can answer.
+    if not ANTHROPIC_KEY and not GEMINI_KEY:
+        # Still try cache — if it hits, we proceed. If not, show note.
+        _pre_check = vc.get_cached_validation(raw or "")
+        if not _pre_check:
+            st.markdown("""<div class="note">
+              <strong>35+ SMB verticals available.</strong>
+              Try: beauty salons, yoga studios, restaurants, dog grooming,
+              cleaning, auto repair, artisan bakeries, fitness, photography,
+              veterinary, renovation trades, or fitness.
+              <br><span style="font-size:0.75rem;">Full free-text AI entry activates
+              next month — or add a free Gemini API key to unlock it now.</span>
+            </div>""", unsafe_allow_html=True)
+            # Don't stop — let cache attempt proceed below
 
     # Cache validation per (raw_input, geo) so it doesn't re-fire on every rerender
     cache_key = f"val_{raw}_{geo}"
@@ -530,68 +578,110 @@ else:
     display_vertical = vertical_sel
 
 # ── Output ──────────────────────────────────────────────────────────────────────
-st.markdown('<div class="sec">Obtainable market</div>', unsafe_allow_html=True)
+st.markdown('<div class="sec">Market Opportunity &nbsp;·&nbsp; TAM / SAM / SOM</div>',
+            unsafe_allow_html=True)
 
 if not res.get("data_complete"):
-    missing = []
-    if res.get("smb_count") is None:    missing.append("SMB count (no Eurostat data for this NACE)")
-    if res.get("effective_adoption_pct") is None: missing.append("adoption rate")
-    st.markdown(f"""<div class="note">
-      Live data for <strong>{display_vertical} · {geo_label(geo)}</strong>
-      is incomplete ({', '.join(missing)}).
-      Eurostat suppresses low-sample cells for some countries or NACE codes.
-      No figure is shown rather than an invented one. Try another country.
-    </div>""", unsafe_allow_html=True)
+    _miss = []
+    if res.get("smb_count") is None: _miss.append("SMB count (no Eurostat data for this NACE)")
+    if res.get("effective_adoption_pct") is None: _miss.append("adoption rate")
+    st.markdown(
+        '<div class="note">Live data for <strong>' + display_vertical +
+        ' &middot; ' + geo_label(geo) + '</strong> is incomplete (' +
+        ', '.join(_miss) + '). Eurostat suppresses low-sample cells for some ' +
+        'countries or NACE codes. No figure is shown rather than an invented one. ' +
+        'Try another country.</div>', unsafe_allow_html=True)
 else:
-    c1, c2 = st.columns([1.1, 1])
-    with c1:
-        ai_tag     = '<span class="ai-badge">AI + Live Eurostat</span>' if use_ai else ""
-        hero_mkt   = fmt_eur(res["obtainable_market_eur"])
-        hero_geo   = geo_label(geo)
-        hero_adopt = str(res["effective_adoption_pct"]) + "% adoption"
-        hero_smbs  = fmt_int(res["smb_count"]) + " SMBs"
-        hero_arpu  = "\u20ac" + str(int(res["arpu"])) + " ARPU/yr"
-        hero_chips = fmt_int(res["adopting_smbs"]) + " adopting SMBs"
-        hero_stats = hero_smbs + " &nbsp;·&nbsp; " + hero_adopt + " &nbsp;·&nbsp; " + hero_arpu
-        hero_html  = (
-            '<div class="hero">'
-            + '<div class="hero-lbl">Obtainable Market &middot; ' + hero_geo + ' &middot; ' + str(latest_year) + '</div>'
-            + '<div class="hero-val">' + hero_mkt + '</div>'
-            + '<div style="margin-top:14px;">'
-            + '<span class="chip">&#128205; ' + display_vertical + '</span>'
-            + '<span class="chip">' + hero_chips + ' adopting SMBs</span>'
-            + ai_tag
-            + '</div>'
-            + '<div style="font-size:0.75rem;color:rgba(255,255,255,0.82);margin-top:14px;line-height:1.6;">' 
-            + hero_stats
-            + '</div>'
-            + '</div>'
-        )
-        st.markdown(hero_html, unsafe_allow_html=True)
+    _geo_yr = geo_label(geo) + " · " + str(latest_year)
+    _ai_tag = '<span class="ai-badge" style="font-size:0.55rem;vertical-align:middle;">AI</span>' if use_ai else ""
+    _t1, _t2, _t3 = st.columns(3)
 
-    with c2:
+    with _t1:
+        st.markdown(
+            '<div style="background:#1A2B3C;border-radius:10px;padding:20px 22px;'
+            'box-shadow:0 2px 8px rgba(0,0,0,0.15);">'
+            '<div style="font-size:0.58rem;font-weight:700;letter-spacing:0.18em;'
+            'text-transform:uppercase;color:rgba(255,255,255,0.5);margin-bottom:4px;">'
+            'TAM &middot; ' + _geo_yr + '</div>'
+            '<div style="font-size:2rem;font-weight:800;color:#FFFFFF;line-height:1;">'
+            + fmt_eur(res["tam_eur"]) +
+            '</div>'
+            '<div style="font-size:0.68rem;color:rgba(255,255,255,0.55);margin-top:8px;">'
+            + fmt_int(res["smb_count"]) + ' SMBs &times; &euro;' + str(int(res["arpu"])) + ' ARPU'
+            '</div>'
+            '<div style="font-size:0.6rem;color:rgba(255,255,255,0.38);margin-top:4px;">'
+            'Total — every SMB in this vertical</div>'
+            '</div>', unsafe_allow_html=True)
+
+    with _t2:
+        st.markdown(
+            '<div style="background:#2F5D50;border-radius:10px;padding:20px 22px;'
+            'box-shadow:0 2px 12px rgba(0,0,0,0.2);">'
+            '<div style="font-size:0.58rem;font-weight:700;letter-spacing:0.18em;'
+            'text-transform:uppercase;color:rgba(255,255,255,0.65);margin-bottom:4px;">'
+            'SAM &middot; ' + _geo_yr + ' ' + _ai_tag + '</div>'
+            '<div style="font-size:2rem;font-weight:800;color:#FFFFFF;line-height:1;">'
+            + fmt_eur(res["sam_eur"]) +
+            '</div>'
+            '<div style="font-size:0.68rem;color:rgba(255,255,255,0.75);margin-top:8px;">'
+            + fmt_int(res["adopting_smbs"]) + ' adopting SMBs &middot; '
+            + str(res["effective_adoption_pct"]) + '% adoption'
+            '</div>'
+            '<div style="font-size:0.6rem;color:rgba(255,255,255,0.48);margin-top:4px;">'
+            'Serviceable — already using web services</div>'
+            '</div>', unsafe_allow_html=True)
+
+    with _t3:
+        st.markdown(
+            '<div style="background:#3A7A68;border-radius:10px;padding:20px 22px;'
+            'box-shadow:0 2px 8px rgba(0,0,0,0.12);">'
+            '<div style="font-size:0.58rem;font-weight:700;letter-spacing:0.18em;'
+            'text-transform:uppercase;color:rgba(255,255,255,0.65);margin-bottom:4px;">'
+            'SOM &middot; ' + _geo_yr + '</div>'
+            '<div style="font-size:2rem;font-weight:800;color:#FFFFFF;line-height:1;">'
+            + fmt_eur(res["som_eur"]) +
+            '</div>'
+            '<div style="font-size:0.68rem;color:rgba(255,255,255,0.75);margin-top:8px;">'
+            + str(int(res["capture_rate_pct"])) + '% of SAM &middot; your capture rate'
+            '</div>'
+            '<div style="font-size:0.6rem;color:rgba(255,255,255,0.48);margin-top:4px;">'
+            'Obtainable — your realistic near-term win</div>'
+            '</div>', unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="prov" style="margin-top:8px;">'
+        'TAM = total SMBs &times; your ARPU. '
+        'SAM = TAM &times; digital adoption rate (Eurostat, live, per country). '
+        'SOM = SAM &times; your market capture rate. '
+        'All three use your ARPU — output reflects your economics, not a generic benchmark.'
+        '</div>', unsafe_allow_html=True)
+
+    # methodology detail expander
+    with st.expander("How this is computed", expanded=False):
         if res.get("adoption_was_adjusted") and res.get("micro_basis"):
             b = res["micro_basis"]
-            adj = (f"Sector adoption <strong>{res['headline_adoption_pct']}%</strong> "
-                   f"adjusted to <strong>{res['effective_adoption_pct']}%</strong> "
-                   f"for micro-enterprises using {geo_label(geo)}'s size gradient "
-                   f"({b['small_10_49']}% small vs {b['base_ge10']}% base in {b['year']}, "
-                   f"ratio {res['micro_ratio']}).")
+            adj_txt = (f"Adoption {res['headline_adoption_pct']}% (sector, live Eurostat) "
+                       f"adjusted to {res['effective_adoption_pct']}% for micro-enterprises "
+                       f"using {geo_label(geo)}'s size gradient "
+                       f"({b['small_10_49']}% small vs {b['base_ge10']}% base, "
+                       f"ratio {res['micro_ratio']}, {b['year']}).")
         else:
-            adj = (f"Sector website-adoption <strong>{res['headline_adoption_pct']}%</strong> "
-                   f"({geo_label(geo)}, live Eurostat). "
-                   f"{'Size gradient not available for this country — unadjusted.' if adjust else 'Micro-adjustment off.'}")
+            adj_txt = (f"Adoption {res['headline_adoption_pct']}% "
+                       f"({geo_label(geo)}, live Eurostat isoc_ciwebn2). "
+                       f"{'Size gradient not available — unadjusted.' if adjust else 'Micro-adjustment off.'}")
         nace_note = f"NACE {nace_group_used} · " if nace_group_used else ""
-        st.markdown(f"""<div style="background:#FFFFFF;border:1px solid #CDD2DB;
-          border-radius:10px;padding:18px 20px;height:100%;">
-          <div style="font-size:0.62rem;font-weight:700;letter-spacing:0.14em;
-            text-transform:uppercase;color:{CLR};margin-bottom:8px;">How this is computed</div>
-          <div style="font-size:0.82rem;color:#0D1117;line-height:1.6;">
-            Obtainable Market = SMBs × Adoption × ARPU<br><br>{adj}
-          </div>
-          <div class="prov">{nace_note}Enterprise count: Eurostat sbs_ovw_act.
-            Adoption: Eurostat isoc_ciwebn2 / isoc_ciweb. All live data.</div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown(
+            f"**TAM** = {fmt_int(res['smb_count'])} SMBs × €{int(res['arpu'])} ARPU = {fmt_eur(res['tam_eur'])}  \n"
+            f"**SAM** = TAM × {res['effective_adoption_pct']}% adoption = {fmt_eur(res['sam_eur'])}  \n"
+            f"**SOM** = SAM × {int(res['capture_rate_pct'])}% capture = {fmt_eur(res['som_eur'])}  \n\n"
+            f"{adj_txt}  \n"
+            f"{nace_note}Enterprise count: Eurostat sbs_ovw_act. "
+            f"Adoption: Eurostat isoc_ciwebn2 / isoc_ciweb. All live data."
+        )
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        pass  # spacer — projection section follows
 
     # ── Projection ───────────────────────────────────────────────────────────────
     st.markdown('<div class="sec">2025–2030 projection</div>', unsafe_allow_html=True)
@@ -604,12 +694,12 @@ else:
                               ["2025","2026","2027","2028","2029","2030"])
     if proj:
         pdf = pd.DataFrame(proj)
-        pdf["Obtainable Market"] = pdf["market_eur"].apply(fmt_eur)
+        pdf["SAM (€)"] = pdf["market_eur"].apply(fmt_eur)
         pdf["SMBs"]              = pdf["smb_count"].apply(fmt_int)
         pdf["Adopting SMBs"]     = pdf["adopting_smbs"].apply(fmt_int)
         pdf["Adoption %"]        = pdf["adoption_pct"].astype(str) + "%"
         st.dataframe(pdf.rename(columns={"year":"Year"})
-                     [["Year","SMBs","Adoption %","Adopting SMBs","Obtainable Market"]],
+                     [["Year","SMBs","Adoption %","Adopting SMBs","SAM (€)"]],
                      use_container_width=True, hide_index=True, height=250)
         st.markdown(f'<div class="prov">SMB base +{smb_growth}%/yr compound; '
                     f'adoption +{adopt_growth}pp/yr linear (capped 100%); ARPU flat.</div>',
