@@ -42,9 +42,16 @@ def derive_smb_count(smb_base_df, vertical, geo, year):
     df["Enterprise Count"] = pd.to_numeric(
         df["Enterprise Count"].astype(str).str.replace(",", "."), errors="coerce"
     )
-    df = df[(df["Vertical"] == vertical) & (df["Geo"] == geo) & (df["Year"].astype(str) == str(year))]
-    if df.empty:
-        return None, {}
+    df_year = df[(df["Vertical"] == vertical) & (df["Geo"] == geo) & (df["Year"].astype(str) == str(year))]
+    if df_year.empty:
+        # Fall back to most recent available year for this vertical+geo,
+        # same pattern as get_headline_adoption. Covers year-lag mismatches
+        # between SBS and ICT survey publication calendars.
+        df_any = df[(df["Vertical"] == vertical) & (df["Geo"] == geo)]
+        if df_any.empty:
+            return None, {}
+        df_year = df_any.sort_values("Year").iloc[[-1]]
+    df = df_year
 
     total = 0.0
     large = 0.0
