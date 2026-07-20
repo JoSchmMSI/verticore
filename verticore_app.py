@@ -545,21 +545,29 @@ if not res.get("data_complete"):
 else:
     c1, c2 = st.columns([1.1, 1])
     with c1:
-        ai_tag = '<span class="ai-badge">AI + Live Eurostat</span>' if use_ai else ""
-        st.markdown(f"""<div class="hero">
-          <div class="hero-lbl">Obtainable Market · {geo_label(geo)} · {latest_year}</div>
-          <div class="hero-val">{fmt_eur(res['obtainable_market_eur'])}</div>
-          <div style="margin-top:14px;">
-            <span class="chip">📍 {display_vertical}</span>
-            <span class="chip">{fmt_int(res['adopting_smbs'])} adopting SMBs</span>
-            {ai_tag}
-          </div>
-          <div style="font-size:0.75rem;color:rgba(255,255,255,0.82);margin-top:14px;line-height:1.6;">
-            {fmt_int(res['smb_count'])} SMBs &nbsp;·&nbsp;
-            {res['effective_adoption_pct']}% adoption &nbsp;·&nbsp;
-            €{res['arpu']:.0f} ARPU/yr
-          </div>
-        </div>""", unsafe_allow_html=True)
+        ai_tag     = '<span class="ai-badge">AI + Live Eurostat</span>' if use_ai else ""
+        hero_mkt   = fmt_eur(res["obtainable_market_eur"])
+        hero_geo   = geo_label(geo)
+        hero_adopt = str(res["effective_adoption_pct"]) + "% adoption"
+        hero_smbs  = fmt_int(res["smb_count"]) + " SMBs"
+        hero_arpu  = "\u20ac" + str(int(res["arpu"])) + " ARPU/yr"
+        hero_chips = fmt_int(res["adopting_smbs"]) + " adopting SMBs"
+        hero_stats = hero_smbs + " &nbsp;·&nbsp; " + hero_adopt + " &nbsp;·&nbsp; " + hero_arpu
+        hero_html  = (
+            '<div class="hero">'
+            + '<div class="hero-lbl">Obtainable Market &middot; ' + hero_geo + ' &middot; ' + str(latest_year) + '</div>'
+            + '<div class="hero-val">' + hero_mkt + '</div>'
+            + '<div style="margin-top:14px;">'
+            + '<span class="chip">&#128205; ' + display_vertical + '</span>'
+            + '<span class="chip">' + hero_chips + ' adopting SMBs</span>'
+            + ai_tag
+            + '</div>'
+            + '<div style="font-size:0.75rem;color:rgba(255,255,255,0.82);margin-top:14px;line-height:1.6;">' 
+            + hero_stats
+            + '</div>'
+            + '</div>'
+        )
+        st.markdown(hero_html, unsafe_allow_html=True)
 
     with c2:
         if res.get("adoption_was_adjusted") and res.get("micro_basis"):
