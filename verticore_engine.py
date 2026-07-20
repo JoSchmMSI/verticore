@@ -160,37 +160,78 @@ def get_default_arpu(arpu_df, vertical):
 # ── The core SOM computation ───────────────────────────────────────────────────
 def compute_market(smb_base_df, adoption_df, sizeclass_df,
                    vertical, nace_group, geo, year, arpu,
-                   apply_micro_adjust=True):
+                   apply_micro_adjust=True, capture_rate_pct=10.0):
     """
-    Returns a dict with the full computation and its provenance, or None inputs
-    flagged transparently where live data is missing (never fabricated).
+    Three-tier market sizing — TAM / SAM / SOM — all using customer ARPU.
+
+    TAM = Total SMBs in vertical (all sizes, Eurostat sbs_ovw_act) x ARPU
+          The absolute ceiling: every business in the vertical that could
+          theoretically buy a web-services product at this price point.
+
+    SAM = TAM x Digital Adoption Rate (Eurostat isoc_ciwebn2, per country)
+          The serviceable slice: businesses already using web services, i.e.
+          already in the market for this category of product.
+
+    SOM = SAM x Market Capture Rate (customer-set, default 10%)
+          The obtainable slice: what this specific buyer can realistically
+          win given their current market position. Customer sets this slider
+          based on their known penetration or growth ambition.
+
+    All three use the same customer-input ARPU — the output reflects the
+    buyer's real economics, not a generic industry benchmark.
+
+    Returns a dict with full provenance. Never fabricates missing data.
     """
     smb, smb_detail = derive_smb_count(smb_base_df, vertical, geo, year)
     headline = get_headline_adoption(adoption_df, vertical, geo, year)
     micro_ratio, micro_basis = compute_micro_ratio(sizeclass_df, nace_group, geo, year)
     eff_adopt, was_adjusted = effective_adoption(headline, micro_ratio, apply_micro_adjust)
 
-    market = None
+    arpu_f = float(arpu) if arpu else None
+
+    # TAM — total market, customer ARPU
+    tam = None
+    if smb is not None and arpu_f:
+        tam = smb * arpu_f
+
+    # SAM — adoption-filtered market, same ARPU
+    sam = None
     adopting_smbs = None
-    if smb is not None and eff_adopt is not None and arpu:
+    if smb is not None and eff_adopt is not None and arpu_f:
         adopting_smbs = smb * (eff_adopt / 100.0)
-        market = adopting_smbs * float(arpu)
+        sam = adopting_smbs * arpu_f
+
+    # SOM — capture-rate slice of SAM
+    som = None
+    if sam is not None:
+        som = sam * (float(capture_rate_pct) / 100.0)
 
     return {
         "vertical": vertical,
         "geo": geo,
         "year": year,
+        # SMB base
         "smb_count": smb,
         "smb_detail": smb_detail,
+        # Adoption
         "headline_adoption_pct": headline,
         "micro_ratio": micro_ratio,
         "micro_basis": micro_basis,
         "effective_adoption_pct": eff_adopt,
         "adoption_was_adjusted": was_adjusted,
-        "arpu": float(arpu) if arpu else None,
+        # Economics
+        "arpu": arpu_f,
+        "capture_rate_pct": float(capture_rate_pct),
+        # Market tiers
+        "tam_eur": tam,
         "adopting_smbs": adopting_smbs,
-        "obtainable_market_eur": market,
-        "data_complete": all(x is not None for x in [smb, eff_adopt, arpu]),
+        "sam_eur": sam,
+        "som_eur": som,
+        # Legacy key — points to SAM (the serviceable addressable market)
+        # kept for backward compat with projection + ranking functions
+        "obtainable_market_eur": sam,
+        # Completeness
+        "data_complete": all(x is not None for x in [smb, eff_adopt, arpu_f]),
     }
 
 
