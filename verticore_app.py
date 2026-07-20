@@ -40,7 +40,7 @@ def _secret(key, default=""):
 
 SHEET_ID    = _secret("VERTICORE_SHEET_ID")
 ANTHROPIC_KEY = _secret("ANTHROPIC_API_KEY")
-GEMINI_KEY    = _secret("GEMINI_API_KEY")   # free tier — no credit card needed
+GROQ_KEY      = _secret("GROQ_API_KEY")     # free tier — gsk_ key, no credit card
 SCOPES      = ["https://www.googleapis.com/auth/spreadsheets.readonly",
                "https://www.googleapis.com/auth/drive.readonly"]
 CLR         = "#2F5D50"
@@ -155,12 +155,12 @@ CLAUDE_MODEL = "claude-sonnet-4-6"
 
 def claude_call(system_prompt, user_prompt, max_tokens=800):
     """
-    Hybrid AI call — three layers:
-    1. Claude API (if ANTHROPIC_API_KEY set)
-    2. Gemini free tier (if GEMINI_API_KEY set)
-    3. Returns None (teaser card shown)
-    Cache is checked before this function is called (in validate_vertical
-    and generate_build_priority wrappers).
+    Hybrid AI call — two layers:
+    1. Claude API (if ANTHROPIC_API_KEY set — next month)
+    2. Groq free tier (if GROQ_API_KEY set — free now, gsk_ key, no card)
+       Uses llama-3.3-70b-versatile via OpenAI-compatible endpoint.
+       14,400 requests/day free. Key format confirmed stable (gsk_ prefix).
+    Cache is always checked before this function is called.
     """
     # Layer 1: Claude API
     if ANTHROPIC_KEY:
@@ -187,24 +187,31 @@ def claude_call(system_prompt, user_prompt, max_tokens=800):
         except Exception:
             pass
 
-    # Layer 2: Gemini free tier
-    if GEMINI_KEY:
+    # Layer 2: Groq free tier (llama-3.3-70b-versatile)
+    # OpenAI-compatible endpoint — standard JSON, Bearer auth, gsk_ key
+    if GROQ_KEY:
         try:
-            # Combine system + user for Gemini (no system role in free REST API)
-            combined = system_prompt.strip() + "\n\n" + user_prompt.strip()
             r = req.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
-                json={"contents": [{"parts": [{"text": combined}]}],
-                      "generationConfig": {"maxOutputTokens": max_tokens,
-                                           "temperature": 0.3}},
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "max_tokens": max_tokens,
+                    "temperature": 0.3,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user",   "content": user_prompt},
+                    ],
+                },
                 timeout=30,
             )
             if r.status_code == 200:
-                candidates = r.json().get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    return "".join(p.get("text", "") for p in parts)
+                choices = r.json().get("choices", [])
+                if choices:
+                    return choices[0].get("message", {}).get("content", "")
         except Exception:
             pass
 
@@ -441,7 +448,7 @@ st.markdown('<div class="sec">Select or enter your target vertical</div>',
 col_mode, col_v, col_geo, col_arpu = st.columns([1.2, 2, 2, 1.5])
 with col_mode:
     _mode_opts = ["Seed vertical", "Enter any vertical"]
-    _ai_status = "AI enabled (Claude)." if ANTHROPIC_KEY else                ("AI enabled (Gemini free)." if GEMINI_KEY else                "35+ verticals available from cache — AI coming soon.")
+    _ai_status = "AI enabled (Claude)." if ANTHROPIC_KEY else                ("AI enabled (Gemini free)." if GROQ_KEY else                "35+ verticals available from cache — AI coming soon.")
     _mode_help = ("Seed = instant pre-loaded data. "
                   "Enter any vertical = resolves any SMB vertical. " + _ai_status)
     mode = st.selectbox("Mode", _mode_opts, key="v_mode", help=_mode_help)
@@ -488,7 +495,7 @@ if use_ai:
 
     # Allow through if Gemini key available OR cache may have this vertical.
     # Only block if truly nothing can answer.
-    if not ANTHROPIC_KEY and not GEMINI_KEY:
+    if not ANTHROPIC_KEY and not GROQ_KEY:
         # Still try cache — if it hits, we proceed. If not, show note.
         _pre_check = vc.get_cached_validation(raw or "")
         if not _pre_check:
@@ -511,12 +518,17 @@ if use_ai:
     validated = st.session_state[cache_key]
 
     if not validated.get("valid"):
-        st.markdown(f"""<div class="note">
-          <strong>Not recognised:</strong> {validated.get('reason',
-          'This does not appear to be a valid SMB web-services vertical.')}<br>
-          <span style="font-size:0.75rem;">Try: beauty salons, yoga studios,
-          independent pharmacies, artisan bakeries, dog grooming, auto repair…</span>
-        </div>""", unsafe_allow_html=True)
+        _reason = validated.get("reason", "Not a recognised SMB web-services vertical.")
+        _cached_list = ", ".join(sorted(set(
+            v["canonical_name"] for v in vc.VALIDATION_CACHE.values()
+        ))[:18])
+        st.markdown(
+            '<div class="note">' +
+            '<strong>Not recognised:</strong> ' + _reason + '<br>' +
+            '<span style="font-size:0.75rem;">Available now without an API key: ' +
+            _cached_list + ' — and more. ' +
+            'Add a free Gemini key to unlock <em>any</em> SMB vertical.</span>' +
+            '</div>', unsafe_allow_html=True)
         st.stop()
 
     # Show confirmation
@@ -712,9 +724,12 @@ else:
 
     bp_key = f"bp_{display_vertical}_{geo}_{arpu}"
     if bp_key not in st.session_state:
-        if not ANTHROPIC_KEY:
-            pass  # no-key: teaser card shown below via `if not ANTHROPIC_KEY and not features`
-        else:
+        # Always try cache first — no API key needed for cached verticals
+        cached_feats = vc.get_cached_features(display_vertical)
+        if cached_feats:
+            st.session_state[bp_key] = score_build_priority(cached_feats)
+        elif ANTHROPIC_KEY or GROQ_KEY:
+            # Live AI call if any key is available
             with st.spinner("Generating build-priority analysis…"):
                 raw_features = generate_build_priority(
                     display_vertical,
@@ -725,21 +740,18 @@ else:
                     geo_label(geo),
                 )
                 st.session_state[bp_key] = score_build_priority(raw_features)
+        else:
+            st.session_state[bp_key] = []
 
     features = st.session_state.get(bp_key, [])
-    if not ANTHROPIC_KEY and not features:
-        st.markdown(f"""<div style="background:#F8FFFE;border:1px solid #A8C4BB;
-          border-radius:8px;padding:20px 24px;text-align:center;">
-          <div style="font-size:1.1rem;font-weight:700;color:{CLR};margin-bottom:8px;">
-            ◧ AI Build-Priority Ranking</div>
-          <div style="font-size:0.85rem;color:#52596B;line-height:1.7;">
-            The engine analyses <strong>{display_vertical}</strong> pain points,
-            scores each buildable feature by commercial opportunity, and returns
-            a ranked list of what to build next — with the euro prize attached.<br><br>
-            <strong>Available shortly.</strong> The market-sizing data above is
-            fully live and ready to present today.
-          </div>
-        </div>""", unsafe_allow_html=True)
+    if not features:
+        _avail = "beauty salons, yoga, restaurants, taxi, logistics, dog grooming, cleaning, auto repair, bakeries, fitness, photography, renovation"
+        st.markdown(
+            '<div class="note">' +
+            'Build-priority ranking not available for <strong>' + display_vertical + '</strong> yet. ' +
+            'Try: ' + _avail + '.<br>' +
+            '<span style="font-size:0.75rem;">Add a free Gemini API key to Streamlit secrets ' +
+            'to unlock any vertical.</span></div>', unsafe_allow_html=True)
     elif features:
         for i, f in enumerate(features):
             score = f.get("priority_score", 0)
